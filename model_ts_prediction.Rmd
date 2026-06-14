@@ -1,0 +1,1050 @@
+---
+output:
+  html_document:
+    toc: true            # Включить содержание
+    toc_float: true      # Плавающее содержание 
+    toc_depth: 3         # Глубина заголовков (1-6)
+error: FALSE
+warning: FALSE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+library(DT)
+library(formattable)
+library(kableExtra)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(Metrics)
+library(gridExtra)
+library(tidyr)
+library(grid) 
+library(patchwork)
+
+
+print_df <- function(df) {
+  datatable(df, 
+            options = list(scrollX = TRUE,  # Горизонтальная прокрутка
+                           pageLength = 10, 
+                           autoWidth = TRUE),
+            class = 'display nowrap',       # Отключение переноса текста для удобной прокрутки
+            rownames = FALSE)               # Отключение номеров строк 
+}
+```
+
+## Моделирование ряда вида кусочно-линейный (тренд) + броуновское движение (шум)
+
+Параметры:
+
+- интенсивность изломов $\lambda$
+
+- дисперсия $\sigma_a^2$ тангеса угла наклона тренда, распределенного нормально со средним 0
+
+- дисперсия $\sigma^2$ приращения в броуновском движении
+
+
+#### Моделирование броуновского движения
+
+Дискретная производная броуновского движения --- белый шум. Тогда для моделирования броуновского движения нужно взять накопленную сумму белого шума.   
+
+```{r noise, fig.width=14, fig.height=8}
+set.seed(5)
+n <- 1300
+
+sd <- 1
+mean <- 0
+
+ts_white_noise <- ts(rnorm(n, mean = mean, sd = sd)) 
+ts_br <- ts(cumsum(ts_white_noise))
+
+par(mfrow=c(2,1))
+plot(ts_white_noise, type = 'l', col = "darkred", main = 'Белый шум')
+plot(ts_br, type = 'l',  col = "darkblue", main = 'Броуновское движение')
+```
+
+#### Моделирование кусочно-линейной функции 
+
+Моменты изломов образуют пуассоновский процесс с интенсивностью $\lambda$. Участки между изломами имеют экспоненциальное распределение с параметром $\lambda$. На каждом таком участке между изломами угол наклона постоянен и имеет распределение $N(0, \sigma_a^2)$.
+
+Для пуассоновского процесса количество событий на интервале длины $T$ иммеет распределение пуассона с параметром $\lambda T$. Если известно, что для пуассоновского процесса на интервале произошло ровно $N$ событий, то их моменты появления распределены равномерно на этом интервале. 
+
+```{r trend, fig.width=14, fig.height=8}
+set.seed(5)
+lambda <- 5/1000
+
+mean_a <- 0
+sd_a <- sqrt(0.2)
+
+simulate_poisson_process <- function(lambda, T){
+  sort(runif(rpois(1, lambda*T), 0, T))
+}
+
+breaks <- c(0, simulate_poisson_process(lambda, n), n)
+slopes <- rnorm(length(breaks) - 1, mean = mean_a, sd = sd_a)
+seg_id <- findInterval(1:n, breaks, rightmost.closed = TRUE)
+a_t <- ts(slopes[seg_id])
+
+ts_piecewise_lin <- ts(cumsum(a_t))
+
+par(mfrow=c(2,1))
+plot(a_t, type = 'l', col = "darkred", main = 'Кусочно-постоянная')
+plot(ts_piecewise_lin, type = 'l',  col = "darkblue", main = 'Кусочно-линейная')
+```
+
+#### Итоговый ряд
+
+```{r ts_end, fig.width=14, fig.height=8}
+ts_trend_br <- ts_piecewise_lin + ts_br
+
+plot(ts_trend_br, type = 'l',  col = "darkblue", main = 'Кусочно-линейная + броуновское движение')
+```
+
+
+
+## Прогнозирование
+
+Рассмотрим 4 вида ряда:
+
+1. Линейная функция без шума 
+
+2. Кусочно-линейная функция без шума
+
+3. Броуновское движение
+
+4. Кусочно-линейная + броуновское движение
+
+
+Для них нужно сделать прогноз тремя методами:
+
+1. По последней точке 
+
+2. По известному углу наклона 
+
+3. По углу наклона, оцененному по m точкам (m --- гиперпараметр)
+
+
+```{r}
+build_trajectory_matrix <- function(y, L = 51) {
+  embed(y, L)[, L:1]
+}
+
+forecast_last_point <- function(X_row) {
+  X_row[length(X_row)-1]
+}
+
+forecast_slope_true <- function(X_row, true_slope) {
+  last_value <- X_row[length(X_row)-1]
+  last_value + true_slope
+}
+
+forecast_slope_m <- function(X_row, m) {
+  y_hist <- tail(X_row, m + 1)[1:m]
+
+  slope_hat <- mean(diff(y_hist))
+  
+  last_value <- X_row[length(X_row)-1]
+  last_value + slope_hat
+}
+
+evaluate_m <- function(X_row, m_min = 2, m_max = 50) {
+  suitable_data <- X_row[-length(X_row)]
+  m_best <- m_max
+  m <- m_best
+  score <- Inf
+
+  data_diff <- diff(suitable_data)
+  tr_data <- build_trajectory_matrix(data_diff, m)
+  
+  while (m >= m_min) {
+    left_data <- matrix(tr_data[, -m], ncol = m-1)
+    cur_score <- sum((rowSums(left_data)/(m-1) - tr_data[, m])^2)
+    if (cur_score < score) {
+      score <- cur_score
+      m_best <- m
+    }
+    
+    m <- m - 1
+    tr_data <- tr_data[, -1]
+  }
+  
+  m_best
+}
+```
+
+
+#### Тестирование без подбора m 
+
+Как и выше дисперсия тангенса угла наклона $\sigma_a=0,2$, дисперсия шума $\sigma=0,5$, интенсивность изломов $\lambda = \frac{5}{1000}$. 
+
+Гиперпараметр $m$ возьмем равным 30.
+
+Тогда для MSE прогноза выполнено $\sigma^2 < \text{MSE} < \sigma^2 + \sigma_a^2$.
+
+
+```{r}
+set.seed(5)
+N <- 500
+W <- 51
+m <- 30 
+
+train <- 750
+val <- 250
+test <- 250
+
+lambda <- 5/1000
+
+mse_last_lin <- numeric() 
+mse_last_pc <- numeric()
+mse_last_br <- numeric() 
+mse_last_pc_br <- numeric() 
+
+mse_slope_lin <- numeric() 
+mse_slope_pc <- numeric()
+mse_slope_br <- numeric()
+mse_slope_pc_br <- numeric()
+
+mse_slope_m_lin <- numeric()
+mse_slope_m_pc <- numeric()
+mse_slope_m_br <- numeric()
+mse_slope_m_pc_br <- numeric()
+
+
+all_series_matrix <- matrix(0, nrow = n, ncol = N)
+
+for (i in 1:N){
+  a_lin <- rnorm(1, mean = mean_a, sd = sd_a)
+  ts_lin <- ts(a_lin * 1:n) # линейная
+  
+  breaks <- c(0, simulate_poisson_process(lambda, n), n)
+  slopes <- rnorm(length(breaks) - 1, mean = mean_a, sd = sd_a)
+  seg_id <- findInterval(1:n, breaks, rightmost.closed = TRUE)
+  a_t <- ts(slopes[seg_id])
+
+  ts_pc <- ts(cumsum(a_t)) # кусочно-линейная
+  
+  ts_white_noise <- ts(rnorm(n, mean = mean, sd = sd)) 
+  ts_br <- ts(cumsum(ts_white_noise)) # броуновское
+  
+  ts_pc_br <- ts_pc + ts_br # кусочно-линейна + броуновское
+  # Записываем i-ю реализацию в i-й столбец
+  all_series_matrix[, i] <- as.numeric(ts_pc_br)
+  
+  tm_lin <- build_trajectory_matrix(ts_lin, W)
+  tm_pc <- build_trajectory_matrix(ts_pc, W)
+  tm_br <- build_trajectory_matrix(ts_br, W)
+  tm_pc_br <- build_trajectory_matrix(ts_pc_br, W)
+  
+  nr = nrow(tm_lin)
+  nrib = nr - test + 1
+  
+  # по последней точкк
+  mse_last_lin[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_lin[j, ]
+    (forecast_last_point(data) - data[length(data)])^2
+  }))
+  
+  mse_last_pc[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_pc[j, ]
+    (forecast_last_point(data) - data[length(data)])^2
+  }))
+  
+  mse_last_br[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_br[j, ]
+    (forecast_last_point(data) - data[length(data)])^2
+  }))
+  
+  mse_last_pc_br[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_pc_br[j, ]
+    (forecast_last_point(data) - data[length(data)])^2
+  }))
+  
+  
+  # по известному углу
+  mse_slope_lin[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_lin[j, ]
+    (forecast_slope_true(data, a_lin) - data[length(data)])^2
+  }))
+  
+  mse_slope_pc[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_pc[j, ]
+    (forecast_slope_true(data, a_t[length(a_t) - (nr - j)]) - data[length(data)])^2
+  }))
+  
+  mse_slope_br[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_br[j, ]
+    (forecast_slope_true(data, 0) - data[length(data)])^2
+  }))
+  
+  mse_slope_pc_br[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_pc_br[j, ]
+    (forecast_slope_true(data, a_t[length(a_t) - (nr - j)]) - data[length(data)])^2
+  }))
+  
+  
+  
+  # по оцененному углу
+  mse_slope_m_lin[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_lin[j, ]
+    (forecast_slope_m(data, m) - data[length(data)])^2
+  }))
+  
+  mse_slope_m_pc[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_pc[j, ]
+    (forecast_slope_m(data, m) - data[length(data)])^2
+  }))
+  
+  mse_slope_m_br[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_br[j, ]
+    (forecast_slope_m(data, m) - data[length(data)])^2
+  }))
+  
+  mse_slope_m_pc_br[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_pc_br[j, ]
+    (forecast_slope_m(data, m) - data[length(data)])^2
+  }))
+
+}
+
+write.csv(all_series_matrix, "pc_br_series_new.csv", row.names = FALSE)
+```
+
+
+**Сравнительная таблица при фиксированном m**
+
+```{r}
+summary_mse <- function(x) {
+  m  <- mean(x)
+  se <- sd(x) / sqrt(length(x))
+  
+  data.frame(
+    MSE_mean = m,
+    CI_low   = m - 1.96 * se,
+    CI_high  = m + 1.96 * se
+  )
+}
+
+results <- list(
+  last_lin    = mse_last_lin,
+  last_pc     = mse_last_pc,
+  last_br     = mse_last_br,
+  last_pc_br  = mse_last_pc_br,
+
+  slope_lin   = mse_slope_lin,
+  slope_pc    = mse_slope_pc,
+  slope_br    = mse_slope_br,
+  slope_pc_br = mse_slope_pc_br,
+
+  slope_m_lin   = mse_slope_m_lin,
+  slope_m_pc    = mse_slope_m_pc,
+  slope_m_br    = mse_slope_m_br,
+  slope_m_pc_br = mse_slope_m_pc_br
+)
+
+comparison_table <- do.call(
+  rbind,
+  lapply(names(results), function(name) {
+
+    stats <- summary_mse(results[[name]])
+
+    data.frame(
+      Model_Method = name,
+      stats
+    )
+  })
+)
+
+rownames(comparison_table) <- NULL
+comparison_table$sd_noise <- sd^2
+comparison_table$sd_trend <- sd_a^2
+comparison_table$sd_noise_trend<- sd^2 + sd_a^2
+
+print_df(comparison_table)
+```
+
+
+На основе графика видно, что моделирование соотносится с теоретическими ожиданиями. 
+
+```{r}
+plot_table <- comparison_table |>
+  mutate(
+    Method = str_extract(Model_Method, "^(last|slope_m|slope)"),
+    Series = str_remove(Model_Method, "^(last|slope_m|slope)_")
+  ) |>
+  select(Series, Method, everything(), -Model_Method)
+
+
+ggplot(plot_table,
+       aes(x = Series,
+           y = MSE_mean,
+           color = Method)) +
+
+  geom_point(position = position_dodge(width = 0.5),
+             size = 3) +
+
+  geom_errorbar(
+    aes(ymin = CI_low, ymax = CI_high),
+    width = 0.2,
+    position = position_dodge(width = 0.5)
+  ) +
+  
+  geom_hline(yintercept = sd^2,
+           linetype = "dashed",
+           linewidth = 0.8,
+           color = "red") +
+
+  geom_hline(yintercept = sd^2 + sd_a^2,
+           linetype = "dashed",
+           linewidth = 0.8,
+           color = "red") + 
+
+  geom_hline(yintercept = sd_a^2,
+           linetype = "dashed",
+           linewidth = 0.8,
+           color = "black") +
+  
+  labs(
+    title = "Сравнение прогнозов: MSE с доверительными интервалами",
+    x = "Тип ряда",
+    y = "MSE"
+  ) +
+
+  theme_minimal(base_size = 14)
+```
+
+
+Поближе рассмотрим случай с кусочно-линейной + броуновское движение
+ 
+
+```{r}
+plot_pc_br <- plot_table |>
+  filter(Series == "pc_br")
+
+ggplot(plot_pc_br,
+       aes(x = Method,
+           y = MSE_mean,
+           color = Method)) +
+
+  geom_point(size = 3) +
+
+  geom_errorbar(
+    aes(ymin = CI_low, ymax = CI_high),
+    width = 0.15
+  ) +
+
+  geom_hline(yintercept = sd^2,
+             linetype = "dashed",
+             linewidth = 0.8,
+             color = "red") +
+
+  geom_hline(yintercept = sd^2 + sd_a^2,
+             linetype = "dashed",
+             linewidth = 0.8,
+             color = "red") +
+  
+  labs(
+    title = "Кусочно-линейный тренд + броуновское движение",
+    x = "Метод прогноза",
+    y = "MSE"
+  ) +
+
+  theme_minimal(base_size = 14)
+```
+
+
+
+
+#### Тестирование с подбором m 
+
+Для начала рассмотрим вариант все с теми же параметрами, что и выше, но добавим прогноз с автоподбором m.
+
+```{r}
+set.seed(5)
+
+mse_slope_auto_lin <- numeric()
+mse_slope_auto_pc <- numeric()
+mse_slope_auto_br <- numeric()
+mse_slope_auto_pc_br <- numeric()
+
+m_lin_sample <- numeric(0)
+m_pc_sample <- numeric(0)
+m_br_sample <- numeric(0)
+m_pc_br_sample <- numeric(0)
+
+
+for (i in 1:N){
+  a_lin <- rnorm(1, mean = mean_a, sd = sd_a)
+  ts_lin <- ts(a_lin * 1:n) # линейная
+  
+  breaks <- c(0, simulate_poisson_process(lambda, n), n)
+  slopes <- rnorm(length(breaks) - 1, mean = mean_a, sd = sd_a)
+  seg_id <- findInterval(1:n, breaks, rightmost.closed = TRUE)
+  a_t <- ts(slopes[seg_id])
+
+  ts_pc <- ts(cumsum(a_t)) # кусочно-линейная
+  
+  ts_white_noise <- ts(rnorm(n, mean = mean, sd = sd)) 
+  ts_br <- ts(cumsum(ts_white_noise)) # броуновское
+  
+  ts_pc_br <- ts_pc + ts_br # кусочно-линейна + броуновское
+  
+  
+  tm_lin <- build_trajectory_matrix(ts_lin, W)
+  tm_pc <- build_trajectory_matrix(ts_pc, W)
+  tm_br <- build_trajectory_matrix(ts_br, W)
+  tm_pc_br <- build_trajectory_matrix(ts_pc_br, W)
+  
+  nr = nrow(tm_lin)
+  nrib = nr - test + 1
+  
+  #подбираем m на валидационной части
+  m_lin <- evaluate_m(tm_lin[(train+1):(nrib-1), 1])
+  m_pc <- evaluate_m(tm_pc[(train+1):(nrib-1), 1])
+  m_br <- evaluate_m(tm_br[(train+1):(nrib-1), 1])
+  m_pc_br <- evaluate_m(tm_pc_br[(train+1):(nrib-1), 1])
+  
+  m_lin_sample <<- c(m_lin_sample, m_lin)
+  m_pc_sample <<- c(m_pc_sample, m_pc)
+  m_br_sample <<- c(m_br_sample, m_br)
+  m_pc_br_sample <<- c(m_pc_br_sample, m_pc_br)
+  
+  
+  # по оцененному углу
+  mse_slope_auto_lin[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_lin[j, ]
+    (forecast_slope_m(data, m_lin) - data[length(data)])^2
+  }))
+  
+  mse_slope_auto_pc[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_pc[j, ]
+    (forecast_slope_m(data, m_pc) - data[length(data)])^2
+  }))
+  
+  mse_slope_auto_br[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_br[j, ]
+    (forecast_slope_m(data, m_br) - data[length(data)])^2
+  }))
+  
+  mse_slope_auto_pc_br[i] <- mean(sapply((nrib):nr, function(j) {
+    data <- tm_pc_br[j, ]
+    (forecast_slope_m(data, m_pc_br) - data[length(data)])^2
+  }))
+
+}
+```
+
+```{r}
+summary_mse <- function(x) {
+  m  <- mean(x)
+  se <- sd(x) / sqrt(length(x))
+  
+  data.frame(
+    MSE_mean = m,
+    CI_low   = m - 1.96 * se,
+    CI_high  = m + 1.96 * se
+  )
+}
+
+results <- list(
+  last_lin    = mse_last_lin,
+  last_pc     = mse_last_pc,
+  last_br     = mse_last_br,
+  last_pc_br  = mse_last_pc_br,
+
+  slope_lin   = mse_slope_lin,
+  slope_pc    = mse_slope_pc,
+  slope_br    = mse_slope_br,
+  slope_pc_br = mse_slope_pc_br,
+
+  slope_m_lin   = mse_slope_m_lin,
+  slope_m_pc    = mse_slope_m_pc,
+  slope_m_br    = mse_slope_m_br,
+  slope_m_pc_br = mse_slope_m_pc_br,
+  
+  slope_auto_lin   = mse_slope_auto_lin,
+  slope_auto_pc    = mse_slope_auto_pc,
+  slope_auto_br    = mse_slope_auto_br,
+  slope_auto_pc_br = mse_slope_auto_pc_br
+)
+
+comparison_table <- do.call(
+  rbind,
+  lapply(names(results), function(name) {
+
+    stats <- summary_mse(results[[name]])
+
+    data.frame(
+      Model_Method = name,
+      stats
+    )
+  })
+)
+
+rownames(comparison_table) <- NULL
+comparison_table$sd_noise <- sd^2
+comparison_table$sd_trend <- sd_a^2
+comparison_table$sd_noise_trend<- sd^2 + sd_a^2
+
+print_df(comparison_table)
+```
+
+```{r}
+plot_table_2 <- comparison_table |>
+  mutate(
+    Method = str_extract(Model_Method, "^(last|slope_m|slope_auto|slope)"),
+    Series = str_remove(Model_Method, "^(last|slope_m|slope_auto|slope)_")
+  ) |>
+  select(Series, Method, everything(), -Model_Method)
+
+
+ggplot(plot_table_2,
+       aes(x = Series,
+           y = MSE_mean,
+           color = Method)) +
+
+  geom_point(position = position_dodge(width = 0.5),
+             size = 3) +
+
+  geom_errorbar(
+    aes(ymin = CI_low, ymax = CI_high),
+    width = 0.2,
+    position = position_dodge(width = 0.5)
+  ) +
+  
+  geom_hline(yintercept = sd^2,
+           linetype = "dashed",
+           linewidth = 0.8,
+           color = "red") +
+
+  geom_hline(yintercept = sd^2 + sd_a^2,
+           linetype = "dashed",
+           linewidth = 0.8,
+           color = "red") + 
+
+  geom_hline(yintercept = sd_a^2,
+           linetype = "dashed",
+           linewidth = 0.8,
+           color = "black") +
+  
+  labs(
+    title = "Сравнение прогнозов: MSE с доверительными интервалами",
+    x = "Тип ряда",
+    y = "MSE"
+  ) +
+
+  theme_minimal(base_size = 14)
+```
+
+
+Снова посмотрим на модельный ряд
+
+```{r}
+plot_pc_br_2 <- plot_table_2 |>
+  filter(Series == "pc_br")
+
+ggplot(plot_pc_br_2,
+       aes(x = Method,
+           y = MSE_mean,
+           color = Method)) +
+
+  geom_point(size = 3) +
+
+  geom_errorbar(
+    aes(ymin = CI_low, ymax = CI_high),
+    width = 0.15
+  ) +
+
+  geom_hline(yintercept = sd^2,
+             linetype = "dashed",
+             linewidth = 0.8,
+             color = "red") +
+
+  geom_hline(yintercept = sd^2 + sd_a^2,
+             linetype = "dashed",
+             linewidth = 0.8,
+             color = "red") +
+  labs(
+    title = "Кусочно-линейный тренд + броуновское движение",
+    x = "Метод прогноза",
+    y = "MSE"
+  ) +
+
+  theme_minimal(base_size = 14)
+```
+
+```{r hist, fig.width=14, fig.height=8}
+sample_labels <- c(
+  "Br" = "Броуновское движение",
+  "Lin" = "Линейная",
+  "PC" = "Кусочно-линейная",
+  "PC_Br" = "Кусочно-линейная +\nБроуновское движение"
+)
+
+df <- data.frame(
+  Br = m_br_sample,
+  Lin = m_lin_sample,
+  PC = m_pc_sample,
+  PC_Br = m_pc_br_sample
+) %>%
+  pivot_longer(cols = everything(), names_to = "Sample", values_to = "Value") %>%
+  mutate(Sample_RU = recode(Sample, !!!sample_labels))  
+
+colors <- c("#4040bf", "#2ecc71", "#ef589a", "#f1c40f")
+names(colors) <- c("Br", "Lin", "PC", "PC_Br")
+
+plots <- list()
+sample_names <- unique(df$Sample)
+
+for(i in seq_along(sample_names)) {
+  sample_code <- sample_names[i]
+  sample_data <- df %>% filter(Sample == sample_code)
+  
+  p <- ggplot(sample_data, aes(x = Value)) +
+    geom_histogram(fill = colors[sample_code], color = "white", bins = 30) +
+    labs(
+      title = sample_labels[sample_code],  
+      x = "Значение параметра m", 
+      y = "Частота"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+      axis.title = element_text(size = 9),
+      axis.text = element_text(size = 8),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(fill = NA, color = "gray80"),
+      plot.margin = margin(5, 5, 5, 5)
+    )
+  
+  plots[[i]] <- p
+}
+
+title_grob <- textGrob(
+  "Распределение оптимального параметра m",
+  gp = gpar(fontsize = 14, fontface = "bold"),
+  hjust = 0.5
+)
+
+grid.arrange(
+  grobs = plots,
+  ncol = 2,
+  nrow = 2,
+  top = title_grob
+)
+```
+
+
+
+В случае $\lambda=\frac{5}{1000}$, получаем что для ряда длины 1300 количество изломов будет примерно равно 6, то есть тренд меняется относительно редко. Дисперсия угла наклона в данном случае меньше, чем дирсперсия шума. 
+
+В модели броуновского движения тренд отсутствует, однако если взять малое m, то ряд может выглядеть как имеющий тренд. Поэтому при малых значениях окна оценка наклона основывается на небольшом числе наблюдений и имеет большую дисперсию, что приводит к переобучению на шуме. При увеличении m оценка наклона усредняет случайные колебания и становится близкой к нулю. Поэтому оптимальное m чаще всего принимает большие значения.
+
+Малые значения m возникают в случаях, когда в окно попадает точка излома тренда, поэтому для кусочно-линейной функции чаще m принимает маленькие значения. 
+
+Для модельного ряда кусочно-линейная + броуновское оптимальное значение окна определяется компромиссом между подавлением шума и адаптацией к изменениям наклона.
+
+
+
+### Изменение параметров 
+
+**Изменение интенсивности изломов**
+
+
+```{r}
+set.seed(5)
+
+lambda_grid <- c(
+  2/1000,
+  5/1000,
+  15/1000
+)
+
+results <- data.frame()
+m_values <- data.frame()  
+
+for (lambda in lambda_grid) {
+
+  mse_sample <- numeric(N)
+  m_sample <- numeric(0)
+
+  for (i in 1:N) {
+    breaks <- c(0, simulate_poisson_process(lambda, n), n)
+    slopes <- rnorm(length(breaks) - 1, mean = mean_a, sd = sd_a)
+    seg_id <- findInterval(1:n, breaks, rightmost.closed = TRUE)
+    a_t <- ts(slopes[seg_id])
+
+    ts_pc <- ts(cumsum(a_t))
+
+    ts_white_noise <- ts(rnorm(n, mean = mean, sd = sd))
+    ts_br <- ts(cumsum(ts_white_noise))
+
+    ts_pc_br <- ts_pc + ts_br
+
+    tm <- build_trajectory_matrix(ts_pc_br, W)
+
+    nr <- nrow(tm)
+    nrib <- nr - test + 1
+
+    m_opt <- evaluate_m(tm[(train+1):(nrib-1), 1])
+
+    m_sample <- c(m_sample, m_opt)
+    m_values <- rbind(
+      m_values,
+      data.frame(lambda=lambda, m=m_opt)
+    )
+
+
+    mse_sample[i] <- mean(sapply((nrib):nr, function(j) {
+      data <- tm[j, ]
+      (forecast_slope_m(data, m_opt) - data[length(data)])^2
+    }))
+  }
+
+  mse_mean <- mean(mse_sample)
+  mse_sd <- sd(mse_sample)
+
+  CI_low <- mse_mean - 1.96 * mse_sd / sqrt(N)
+  CI_high <- mse_mean + 1.96 * mse_sd / sqrt(N)
+
+  results <- rbind(
+    results,
+    data.frame(
+      lambda=lambda,
+      Method="slope_auto",
+      MSE_mean=mse_mean,
+      CI_low=CI_low,
+      CI_high=CI_high
+    )
+  )
+}
+```
+
+
+```{r}
+results$lambda <- factor(results$lambda,
+                         labels=c("λ = 0.002",
+                                  "λ = 0.005",
+                                  "λ = 0.015"))
+
+m_values$lambda <- factor(m_values$lambda,
+                          labels=c("λ = 0.002",
+                                   "λ = 0.005",
+                                   "λ = 0.015"))
+
+ggplot(results,
+       aes(x = factor(lambda),  
+           y = MSE_mean,
+           color = factor(lambda), 
+           group = Method)) +     
+  
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+
+  geom_errorbar(
+    aes(ymin = CI_low, ymax = CI_high),
+    width = 0.2,
+    position = position_dodge(width = 0.5)
+  ) +
+
+  geom_hline(yintercept = sd^2,
+             linetype = "dashed",
+             linewidth = 0.8,
+             color = "red") +
+
+  geom_hline(yintercept = sd^2 + sd_a^2,
+             linetype = "dashed",
+             linewidth = 0.8,
+             color = "red") +
+
+  labs(
+    title = "Кусочно-линейный тренд + броуновское движение",
+    x = expression(lambda),  
+    y = "MSE",
+    color = expression(lambda)
+  ) +
+
+  theme_minimal(base_size = 14)
+```
+
+***Гистограммы для оптимального m***
+
+По графикам видно, что чем чаще изломы, тем меньше оптимальное m: для меньшего $\lambda = 0,002$ большие значения m выбираются чаще, чем для большего.
+
+```{r hist_lambda, fig.width=16, fig.height=8}
+ggplot(m_values,
+             aes(x = m)) +
+
+  geom_histogram(
+    bins = 20,
+    fill = "skyblue",
+    color = "black"
+  ) +
+
+  facet_wrap(~lambda, nrow = 1) +
+
+  labs(
+    title = "Распределение оптимального m",
+    x = "m",
+    y = "Частота"
+  ) +
+
+  theme_minimal(base_size = 14)
+
+```
+
+
+
+
+**Изменение дисперсии шума**
+
+```{r}
+sd_grid <- c(
+  0.15,
+  0.5,
+  1
+)
+
+lambda <- 5/1000
+
+set.seed(5)
+
+results <- data.frame()
+m_values <- data.frame()  
+
+for (sd in sd_grid) {
+
+  mse_sample <- numeric(N)
+  m_sample <- numeric(0)
+
+  for (i in 1:N) {
+    breaks <- c(0, simulate_poisson_process(lambda, n), n)
+    slopes <- rnorm(length(breaks) - 1, mean = mean_a, sd = sd_a)
+    seg_id <- findInterval(1:n, breaks, rightmost.closed = TRUE)
+    a_t <- ts(slopes[seg_id])
+
+    ts_pc <- ts(cumsum(a_t))
+
+    ts_white_noise <- ts(rnorm(n, mean = mean, sd = sd))
+    ts_br <- ts(cumsum(ts_white_noise))
+
+    ts_pc_br <- ts_pc + ts_br
+
+    tm <- build_trajectory_matrix(ts_pc_br, W)
+
+    nr <- nrow(tm)
+    nrib <- nr - test + 1
+
+    m_opt <- evaluate_m(tm[(train+1):(nrib-1), 1])
+
+    m_sample <- c(m_sample, m_opt)
+    m_values <- rbind(
+      m_values,
+      data.frame(sd=sd, m=m_opt)
+    )
+
+
+    mse_sample[i] <- mean(sapply((nrib):nr, function(j) {
+      data <- tm[j, ]
+      (forecast_slope_m(data, m_opt) - data[length(data)])^2
+    }))
+  }
+
+  mse_mean <- mean(mse_sample)
+  mse_sd <- sd(mse_sample)
+
+  CI_low <- mse_mean - 1.96 * mse_sd / sqrt(N)
+  CI_high <- mse_mean + 1.96 * mse_sd / sqrt(N)
+
+  results <- rbind(
+    results,
+    data.frame(
+      sd=sd,
+      Method="slope_auto",
+      MSE_mean=mse_mean,
+      CI_low=CI_low,
+      CI_high=CI_high
+    )
+  )
+}
+```
+
+
+
+```{r mse_sd, fig.width=14, fig.height=8}
+results$sd <- factor(results$sd,
+                         labels=c("sd = 0.15",
+                                  "sd = 0.5",
+                                  "sd = 1"))
+
+m_values$sd <- factor(m_values$sd,
+                          labels=c("sd = 0.15",
+                                   "sd = 0.5",
+                                   "sd = 1"))
+
+plots <- list()
+
+for (val in levels(results$sd)) {
+  
+  res_subset <- results[results$sd == val, ]
+  sd_val <- as.numeric(gsub("sd = ", "", val))
+  
+  p <- ggplot(res_subset) +
+    geom_point(aes(x = sd, y = MSE_mean),
+               size = 4, color = "darkblue") +
+    
+    geom_errorbar(aes(x = sd, ymin = CI_low, ymax = CI_high),
+                  width = 0.2, linewidth = 1, color = "darkblue") +
+    
+    geom_hline(yintercept = sd_val^2,
+               linetype = "dashed", linewidth = 0.8, color = "red") +
+    geom_hline(yintercept = sd_val^2 + sd_a^2,
+               linetype = "dashed", linewidth = 0.8, color = "red") +
+    
+    labs(title = val, x = "", y = "MSE") +
+    ylim(0, max(results$CI_high) * 1.1) +
+    theme_minimal(base_size = 12)
+  
+  plots[[val]] <- p
+}
+
+wrap_plots(plots, ncol = 3)
+```
+
+
+
+
+***Гистограммы для оптимального m***
+
+По графику видно, что чем больше шум, тем больше оптимальное m: нужно большее окно, чтобы сгладить влияние шума.
+
+
+```{r hist_sd, fig.width=16, fig.height=8}
+ggplot(m_values,
+             aes(x = m)) +
+
+  geom_histogram(
+    bins = 20,
+    fill = "skyblue",
+    color = "black"
+  ) +
+
+  facet_wrap(~sd, nrow = 1) +
+
+  labs(
+    title = "Распределение оптимального m",
+    x = "m",
+    y = "Частота"
+  ) +
+
+  theme_minimal(base_size = 14)
+
+```
+
+
+
+
+
+
+
+
